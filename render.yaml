@@ -1,0 +1,19 @@
+services:
+  - type: web
+    name: vk-ai-agent
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python3 web_server.py
+    envVars:
+      - key: VK_TOKEN
+        sync: false
+      - key: VK_TOKEN_PHOTOS
+        sync: false
+      - key: VK_GROUP_ID
+        sync: false
+      - key: VK_USER_ID
+        sync: false
+      - key: GITHUB_TOKEN
+        sync: false
+      - key: SUPABASE_KEY
+        sync: false

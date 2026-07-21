@@ -1,0 +1,6 @@
+vk_api
+requests
+python-dotenv
+psycopg2-binary
+beautifulsoup4
+pytz
