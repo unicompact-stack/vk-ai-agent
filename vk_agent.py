@@ -515,18 +515,21 @@ def can_auto_post():
         log.info("Автопостинг: тихие часы (00:00–07:30)")
         return False
 
-    # Проверка лимита постов в день
-    today_count = count_today_posts()
-    if today_count >= MAX_DAILY_POSTS:
-        log.info(f"Автопостинг: лимит достигнут ({today_count}/{MAX_DAILY_POSTS})")
-        return False
-
-    # Проверка интервала (20 минут)
+    # Проверка интервала (20 минут) — ПЕРВОЙ, до запроса к БД
     now = time.time()
     if now - last_auto_post_time < AUTO_POST_INTERVAL:
         remaining = int((AUTO_POST_INTERVAL - (now - last_auto_post_time)) / 60)
         log.info(f"Автопостинг: до следующего поста {remaining} мин")
         return False
+
+    # Проверка лимита постов в день
+    try:
+        today_count = count_today_posts()
+        if today_count >= MAX_DAILY_POSTS:
+            log.info(f"Автопостинг: лимит достигнут ({today_count}/{MAX_DAILY_POSTS})")
+            return False
+    except Exception as e:
+        log.error(f"Ошибка проверки лимита постов: {e}")
 
     return True
 
