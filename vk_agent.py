@@ -43,13 +43,22 @@ VK_TOKEN_PHOTOS = os.getenv('VK_TOKEN_PHOTOS')
 VK_USER_ID = int(os.getenv('VK_USER_ID', '114439622'))
 VK_GROUP_ID = int(os.getenv('VK_GROUP_ID', '0'))
 GITHUB_TOKEN = os.getenv('GITHUB_TOKEN')
+OPENROUTER_KEY = os.getenv('OPENROUTER_API_KEY')
 SUPABASE_KEY = os.getenv('SUPABASE_KEY')
+PERPLEXITY_API_KEY = os.getenv('PERPLEXITY_API_KEY')
+PERPLEXITY_MODEL = os.getenv('PERPLEXITY_MODEL', 'perplexity/sonar-r1-online')
 DIR = os.path.dirname(os.path.abspath(__file__))
 LOG_FILE = os.path.join(DIR, 'agent.log')
 PID_FILE = os.path.join(DIR, 'agent.pid')
 IMAGES_DIR = os.path.join(DIR, 'images')
 POLL_INTERVAL = 3
 MAX_HISTORY = 20
+
+# === Настройки автопостинга ===
+AUTO_POST_INTERVAL = 20 * 60  # 20 минут в секундах
+QUIET_HOURS_START = 0          # Начало тихих часов (00:00)
+QUIET_HOURS_END = 7            # Конец тихих часов (07:30)
+MAX_DAILY_POSTS = 3            # Максимум постов в день
 
 # GitHub Models API (бесплатно)
 GITHUB_MODELS_API = "https://models.inference.ai.azure.com/chat/completions"
@@ -130,53 +139,161 @@ def save_post(user_id, text, image_url, vk_url):
     conn.close()
 
 
-# === AI через GitHub Models (с памятью) ===
+# === AI (OpenRouter → GitHub Models fallback) ===
 
 def ask_ai(text, user_id):
-    """Отправляет запрос в GitHub Models с контекстом диалога"""
-    if not GITHUB_TOKEN:
-        return "❌ Нет GitHub токена"
-
-    # Загружаем историю из БД
+    """Отправляет запрос в AI с контекстом диалога. OpenRouter → GitHub Models."""
     user_history = get_user_history(user_id)
 
-    # Формируем сообщения с историей
     messages = [{"role": "system", "content": SYSTEM_PROMPT}]
     messages.extend(user_history)
     messages.append({"role": "user", "content": text})
 
+    # OpenRouter первый
+    if OPENROUTER_KEY:
+        try:
+            r = requests.post(
+                "https://openrouter.ai/api/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {OPENROUTER_KEY}",
+                    "Content-Type": "application/json"
+                },
+                json={
+                    "model": "openai/gpt-4o-mini",
+                    "messages": messages,
+                    "max_tokens": 1000,
+                    "temperature": 0.7
+                },
+                timeout=30
+            )
+            data = r.json()
+            if "choices" in data and len(data["choices"]) > 0:
+                reply = data["choices"][0]["message"]["content"]
+                add_to_history(user_id, "user", text)
+                add_to_history(user_id, "assistant", reply)
+                log.info("AI: OpenRouter")
+                return reply
+        except Exception as e:
+            log.warning(f"OpenRouter failed, fallback to GitHub Models: {e}")
+
+    # GitHub Models запасной
+    if GITHUB_TOKEN:
+        try:
+            r = requests.post(
+                GITHUB_MODELS_API,
+                headers={
+                    "Authorization": f"Bearer {GITHUB_TOKEN}",
+                    "Content-Type": "application/json"
+                },
+                json={
+                    "model": MODEL,
+                    "messages": messages,
+                    "max_tokens": 1000,
+                    "temperature": 0.7
+                },
+                timeout=30
+            )
+            data = r.json()
+            if "choices" in data and len(data["choices"]) > 0:
+                reply = data["choices"][0]["message"]["content"]
+                add_to_history(user_id, "user", text)
+                add_to_history(user_id, "assistant", reply)
+                log.info("AI: GitHub Models (fallback)")
+                return reply
+            elif "error" in data:
+                log.error(f"GitHub Models error: {data['error']}")
+                return f"Ошибка AI: {data['error'].get('message', 'неизвестно')}"
+        except Exception as e:
+            log.error(f"GitHub Models error: {e}")
+
+    return "Ошибка соединения с AI"
+
+
+# === Поиск через Perplexity (с доступом в интернет) ===
+
+perplexity_exhausted = False  # Флаг: токены Perplexity закончились
+
+
+def notify_vk(text):
+    """Отправляет уведомление пользователю в VK"""
+    try:
+        vk_session = vk_api.VkApi(token=VK_TOKEN)
+        api = vk_session.get_api()
+        api.messages.send(
+            user_id=VK_USER_ID,
+            message=text,
+            random_id=get_random_id()
+        )
+        log.info(f"Уведомление: {text[:80]}")
+    except Exception as e:
+        log.error(f"Ошибка уведомления: {e}")
+
+
+def perplexity_search(query, max_tokens=500):
+    """Ищет информацию через Perplexity API (с доступом в интернет)"""
+    global perplexity_exhausted
+
+    if perplexity_exhausted:
+        return None
+
+    if not PERPLEXITY_API_KEY:
+        log.warning("Perplexity API ключ не задан")
+        return None
+
     try:
         r = requests.post(
-            GITHUB_MODELS_API,
+            "https://api.perplexity.ai/chat/completions",
             headers={
-                "Authorization": f"Bearer {GITHUB_TOKEN}",
+                "Authorization": f"Bearer {PERPLEXITY_API_KEY}",
                 "Content-Type": "application/json"
             },
             json={
-                "model": MODEL,
-                "messages": messages,
-                "max_tokens": 1000,
-                "temperature": 0.7
+                "model": PERPLEXITY_MODEL,
+                "messages": [
+                    {"role": "user", "content": query}
+                ],
+                "max_tokens": max_tokens
             },
             timeout=30
         )
 
         data = r.json()
+
+        # Проверка на ошибки лимита/токенов
+        if "error" in data:
+            error_msg = data['error'].get('message', '') if isinstance(data['error'], dict) else str(data['error'])
+            log.error(f"Perplexity error: {error_msg}")
+
+            # Проверяем тип ошибки (лимит, токены, авторизация)
+            error_lower = error_msg.lower()
+            if any(kw in error_lower for kw in ['rate limit', 'quota', 'credit', 'billing', 'unauthorized', 'insufficient']):
+                perplexity_exhausted = True
+                notify_vk(
+                    "⚠️ Perplexity: токены закончились или лимит превышен.\n"
+                    "Автопостинг переключился на VK группы (старый метод).\n"
+                    "Пополни баланс на vseGPT.ru или обнови ключ."
+                )
+            return None
+
         if "choices" in data and len(data["choices"]) > 0:
-            reply = data["choices"][0]["message"]["content"]
-            # Сохраняем в историю в БД
-            add_to_history(user_id, "user", text)
-            add_to_history(user_id, "assistant", reply)
-            return reply
-        elif "error" in data:
-            log.error(f"GitHub Models error: {data['error']}")
-            return f"❌ Ошибка AI: {data['error'].get('message', 'неизвестно')}"
+            return data["choices"][0]["message"]["content"]
         else:
-            return "❌ Неожиданный ответ от AI"
+            return None
 
     except Exception as e:
-        log.error(f"AI error: {e}")
-        return f"❌ Ошибка соединения с AI"
+        log.error(f"Perplexity error: {e}")
+        return None
+
+
+def search_trending_topics(query="горящие туры.travel"):
+    """Ищет трендовые темы через Perplexity"""
+    result = perplexity_search(
+        f"Найди 3 трендовых поста за последние 24 часа на тему: {query}. "
+        "Для каждого: заголовок, краткое описание (2-3 предложения), почему это интересно. "
+        "Формат: нумерованный список.",
+        max_tokens=800
+    )
+    return result
 
 
 # === Отправка в VK ===
@@ -364,6 +481,125 @@ GREETING_RESPONSES = [
 # Состояние: ожидание выбора темы (1/2/3)
 pending_topics = []
 
+# === Автопостинг ===
+last_auto_post_time = 0  # Время последнего автопоста (timestamp)
+
+
+def is_quiet_hours():
+    """Проверяет, находимся ли в тихих часах (00:00–07:30)"""
+    now = datetime.now(MOSCOW_TZ)
+    hour = now.hour
+    minute = now.minute
+    current_minutes = hour * 60 + minute
+    quiet_start = QUIET_HOURS_START * 60  # 0 минут
+    quiet_end = QUIET_HOURS_END * 60 + 30  # 7:30 = 450 минут
+    return quiet_start <= current_minutes < quiet_end
+
+
+def can_auto_post():
+    """Проверяет, можно ли делать автопостинг"""
+    global last_auto_post_time
+
+    # Проверка тихих часов
+    if is_quiet_hours():
+        log.info("Автопостинг: тихие часы (00:00–07:30)")
+        return False
+
+    # Проверка лимита постов в день
+    today_count = count_today_posts()
+    if today_count >= MAX_DAILY_POSTS:
+        log.info(f"Автопостинг: лимит достигнут ({today_count}/{MAX_DAILY_POSTS})")
+        return False
+
+    # Проверка интервала (20 минут)
+    now = time.time()
+    if now - last_auto_post_time < AUTO_POST_INTERVAL:
+        remaining = int((AUTO_POST_INTERVAL - (now - last_auto_post_time)) / 60)
+        log.info(f"Автопостинг: до следующего поста {remaining} мин")
+        return False
+
+    return True
+
+
+def do_auto_post(api):
+    """Выполняет автопостинг: ищет тему → адаптирует → публикует"""
+    global last_auto_post_time
+
+    if not can_auto_post():
+        return
+
+    log.info("Автопостинг: начинаю поиск темы...")
+
+    # Способ 1: Perplexity (поиск в интернете)
+    topic_text = None
+    image_url = None
+    source_label = ""
+
+    if PERPLEXITY_API_KEY:
+        log.info("Автопостинг: ищу через Perplexity...")
+        trending = perplexity_search(
+            "Найди 1 трендовую новость за последние 24 часа про горящие туры, "
+            "путешествия или отдых. Кратко опиши (3-4 предложения) и предложи заголовок. "
+            "Формат: ЗАГОЛОВОК: ... ОПИСАНИЕ: ...",
+            max_tokens=400
+        )
+        if trending:
+            topic_text = trending
+            source_label = "\n\nИсточник: Perplexity"
+            log.info("Автопостинг: тема найдена через Perplexity")
+
+    # Способ 2: VK группы (fallback)
+    if not topic_text:
+        log.info("Автопостинг: ищу в VK группах...")
+        all_posts = search_all_groups(count_per_group=10)
+        filtered = filter_by_engagement(all_posts, min_likes=5, max_age_hours=72)
+
+        if filtered:
+            topic = filtered[0]
+            topic_text = topic.get('text', '')[:200]
+            group_name = topic.get('group_name', '')
+            source_label = f"\n\nИсточник: {group_name}" if group_name else ""
+            image_url = topic.get('image_url')
+            log.info("Автопостинг: тема найдена в VK группах")
+
+    if not topic_text:
+        log.info("Автопостинг: нет подходящих тем")
+        return
+
+    # Генерируем текст через AI
+    post_text = ask_ai(
+        f"Напиши короткий привлекательный пост для VK на основе:\n\n{topic_text}",
+        0
+    )
+    post_text += source_label
+
+    # Пытаемся взять картинку
+    img_path = None
+    if image_url:
+        img_path = download_image(image_url)
+
+    # Если нет картинки из VK — ищем через Яндекс
+    if not img_path:
+        search_query = topic_text[:50].split('\n')[0]
+        img_path = search_image(search_query)
+
+    # Публикуем
+    if img_path:
+        url = post_to_wall_with_image(api, post_text, img_path)
+        try:
+            os.remove(img_path)
+        except:
+            pass
+    else:
+        url = post_to_wall(api, post_text)
+
+    if url:
+        save_post(0, post_text, image_url, url)
+        last_auto_post_time = time.time()
+        log.info(f"Автопостинг: опубликовано — {url}")
+    else:
+        log.error("Автопостинг: ошибка публикации")
+
 
 def handle_command(text, api):
     """Обрабатывает служебные команды (с шаблонами без AI)"""
@@ -380,9 +616,12 @@ def handle_command(text, api):
         return (
             "Команды:\n"
             "найди посты — поиск тем из VK-групп (3 варианта)\n"
+            "поиск [тема] — поиск в интернете через Perplexity\n"
             "1 / 2 / 3 — выбрать тему из списка\n"
             "пост [текст] — опубликовать пост\n"
             "пост с картинкой [тема] — пост + картинка\n"
+            "автопостинг — статус автопостинга\n"
+            "перплексити — статус Perplexity API\n"
             "мои посты — список опубликованных\n"
             "сколько постов — статистика за сегодня\n"
             "помощь — этот список"
@@ -393,6 +632,43 @@ def handle_command(text, api):
         if count == 0:
             return "Сегодня пока нет постов."
         return f"Сегодня опубликовано: {count} пост(ов)."
+
+    # Статус автопостинга
+    if t in ["автопостинг", "автопост статус"]:
+        quiet = is_quiet_hours()
+        count = count_today_posts()
+        remaining = MAX_DAILY_POSTS - count
+        status = "🟢 Включён" if not quiet else "🔴 Тихие часы (00:00–07:30)"
+        return (
+            f"Автопостинг: {status}\n"
+            f"Сегодня: {count}/{MAX_DAILY_POSTS} постов\n"
+            f"Осталось: {remaining}\n"
+            f"Интервал: каждые {AUTO_POST_INTERVAL // 60} мин"
+        )
+
+    # Ручной запуск автопостинга
+    if t in ["автопост", "автопост сейчас"]:
+        global last_auto_post_time
+        last_auto_post_time = 0  # Сбрасываем таймер
+        return "Таймер сброшен. Следующий цикл — автопост через ~3 сек."
+
+    # Статус Perplexity
+    if t in ["перплексити", "perplexity", "перплексити статус"]:
+        global perplexity_exhausted
+        if not PERPLEXITY_API_KEY:
+            return "Perplexity: ключ не задан"
+        if perplexity_exhausted:
+            return (
+                "⚠️ Perplexity: токены закончились\n"
+                "Автопостинг работает через VK группы\n\n"
+                "Напиши 'перплексити сброс' чтобы попробовать снова"
+            )
+        return "✅ Perplexity: работает\nМодель: " + PERPLEXITY_MODEL
+
+    # Сброс флага Perplexity
+    if t in ["перплексити сброс", "perplexity reset"]:
+        perplexity_exhausted = False
+        return "✅ Perplexity сброшен. Попробую найти тему..."
 
     # Поиск постов из VK-групп
     if t in ["найди посты", "найди темы", "поищи посты", "что по трендам"]:
@@ -411,6 +687,18 @@ def handle_command(text, api):
             result += f"{i}. {text_preview}\n   Лайков: {likes} | {group}\n\n"
         result += "Напиши 1, 2 или 3 чтобы опубликовать"
         return result
+
+    # Поиск через Perplexity
+    if t.startswith("поиск ") or t.startswith("найди "):
+        query = text.split(" ", 1)[1] if " " in text else ""
+        if not query:
+            return "Укажи тему. Пример: поиск горящие туры Турция"
+        if not PERPLEXITY_API_KEY:
+            return "Perplexity API не настроен. Добавь PERPLEXITY_API_KEY в .env"
+        result = perplexity_search(f"Расскажи подробно про: {query}", max_tokens=600)
+        if result:
+            return f"🔍 Результат поиска:\n\n{result}"
+        return "Не удалось найти информацию. Попробуй другую тему."
 
     # Выбор темы из списка (1/2/3)
     if t in ['1', '2', '3'] and pending_topics:
@@ -534,9 +822,11 @@ def main():
     with open(PID_FILE, 'w') as f:
         f.write(str(os.getpid()))
 
-    log.info(f"AI-агент запущен. Модель: {MODEL}")
+    ai_provider = "OpenRouter" if OPENROUTER_KEY else "GitHub Models"
+    log.info(f"AI-агент запущен. AI: {ai_provider}")
     log.info(f"Группа: {VK_GROUP_ID}")
     log.info(f"PID: {os.getpid()}")
+    log.info(f"Автопостинг: каждые {AUTO_POST_INTERVAL // 60} мин, лимит {MAX_DAILY_POSTS}/день")
 
     # Хранилище обработанных message_id
     processed = set()
@@ -546,6 +836,12 @@ def main():
             # Подключение к VK
             vk_session = vk_api.VkApi(token=VK_TOKEN)
             api = vk_session.get_api()
+
+            # === Автопостинг ===
+            try:
+                do_auto_post(api)
+            except Exception as e:
+                log.error(f"Ошибка автопостинга: {e}")
 
             # Получаем последние беседы
             conversations = api.messages.getConversations(
