@@ -143,7 +143,11 @@ def save_post(user_id, text, image_url, vk_url):
 
 def ask_ai(text, user_id):
     """Отправляет запрос в AI с контекстом диалога. OpenRouter → GitHub Models."""
-    user_history = get_user_history(user_id)
+    try:
+        user_history = get_user_history(user_id)
+    except Exception as e:
+        log.error(f"Ошибка загрузки истории: {e}")
+        user_history = []
 
     messages = [{"role": "system", "content": SYSTEM_PROMPT}]
     messages.extend(user_history)
@@ -169,8 +173,11 @@ def ask_ai(text, user_id):
             data = r.json()
             if "choices" in data and len(data["choices"]) > 0:
                 reply = data["choices"][0]["message"]["content"]
-                add_to_history(user_id, "user", text)
-                add_to_history(user_id, "assistant", reply)
+                try:
+                    add_to_history(user_id, "user", text)
+                    add_to_history(user_id, "assistant", reply)
+                except Exception as e:
+                    log.error(f"Ошибка сохранения истории: {e}")
                 log.info("AI: OpenRouter")
                 return reply
         except Exception as e:
@@ -196,8 +203,11 @@ def ask_ai(text, user_id):
             data = r.json()
             if "choices" in data and len(data["choices"]) > 0:
                 reply = data["choices"][0]["message"]["content"]
-                add_to_history(user_id, "user", text)
-                add_to_history(user_id, "assistant", reply)
+                try:
+                    add_to_history(user_id, "user", text)
+                    add_to_history(user_id, "assistant", reply)
+                except Exception as e:
+                    log.error(f"Ошибка сохранения истории: {e}")
                 log.info("AI: GitHub Models (fallback)")
                 return reply
             elif "error" in data:
@@ -876,7 +886,11 @@ def main():
 
                 # Если не команда — отправляем в AI с контекстом
                 if not reply:
-                    reply = ask_ai(text, user_id)
+                    try:
+                        reply = ask_ai(text, user_id)
+                    except Exception as e:
+                        log.error(f"AI error: {e}")
+                        reply = "Ошибка AI. Попробуй позже."
 
                 # Отправляем ответ
                 send_vk(api, user_id, reply)
