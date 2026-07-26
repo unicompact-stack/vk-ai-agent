@@ -1,0 +1,15 @@
+name: Keep Render Alive
+on:
+  schedule:
+    - cron: '*/15 * * * *'
+  workflow_dispatch:
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping Render
+        run: |
+          RESPONSE=$(curl -s -o /dev/null -w "%{http_code}" \
+            --max-time 30 \
+            https://vk-ai-agent.onrender.com/)
+          echo "Ping: $RESPONSE"
